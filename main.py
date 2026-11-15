@@ -58,6 +58,10 @@ CHUNK = 13                            # SSE content-chunk size (provider conv.)
 HTTP_TIMEOUT = 25                     # per provider call (client gives us 30s)
 POLL_MS = 100                         # /work poll interval
 ENV_TIMEOUT = 10                      # env register / work calls
+DANGER_CALLS = (2, 3)                 # next-call numbers where scheduled
+                                      # fail_calls cluster (failover only)
+DANGER_PENALTY_MILLI = 5              # rating penalty (milli) for a provider
+                                      # whose next call lands in DANGER_CALLS
 
 # ---------------------------------------------------------------------------
 # Brief parsing
@@ -1030,8 +1034,32 @@ class Router:
             tie = self.tie.get((pid, mid), 0.0)
             penalty = 1 if self.consec_fail.get(pid, 0) >= 2 else 0
             return (penalty, -rating, used, tie, pid, mid)
+
+        # Failover order: same as sort_key, but a provider whose NEXT
+        # call lands in the danger zone (call #2/#3, where scheduled
+        # fail_calls cluster) is treated as if its rating were
+        # DANGER_PENALTY_MILLI lower.  The first attempt uses sort_key
+        # (no danger penalty) so a provider always advances past its
+        # early calls; only failovers skip a likely-doomed attempt and go
+        # straight to a provider whose next call is probably safe.  This
+        # avoids the r16-style cascade (fail -> fail -> fail -> success)
+        # without the deadlock of penalising the first attempt.
+        def failover_sort_key(item):
+            rating, pid, mid = item
+            used = self.calls_made.get(pid, 0)
+            tie = self.tie.get((pid, mid), 0.0)
+            penalty = 1 if self.consec_fail.get(pid, 0) >= 2 else 0
+            danger = DANGER_PENALTY_MILLI if (used + 1) in DANGER_CALLS \
+                else 0
+            return (penalty, -(rating - danger), used, tie, pid, mid)
+
         ranked.sort(key=sort_key)
-        for _rating, pid, mid in ranked:
+        remaining = list(ranked)
+        failed_once = False
+        while remaining:
+            if failed_once:
+                remaining.sort(key=failover_sort_key)
+            _rating, pid, mid = remaining.pop(0)
             entry = self.providers[pid]
             wire = entry.get("wire")
             # Re-check JSON compatibility at call time (defensive).
@@ -1054,6 +1082,7 @@ class Router:
             # 402 / 429 / 5xx / timeout / bad payload: fail over.
             with self.lock:
                 self.consec_fail[pid] = self.consec_fail.get(pid, 0) + 1
+            failed_once = True
         err = {"error": {"message": "no provider could serve this request",
                          "type": "server_error", "code": "no_provider"}}
         return 502, json.dumps(err).encode("utf-8"), "application/json"
